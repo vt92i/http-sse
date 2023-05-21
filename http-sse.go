@@ -6,11 +6,56 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"strings"
+	"sync"
 	"time"
 )
 
 type StreamingData struct {
 	Message string `json:"message"`
+}
+
+var MAX_CONNECTIONS_PER_IP int = 10
+
+type ConnectionPool struct {
+	mu          sync.Mutex
+	connections map[string]int
+}
+
+func (cp *ConnectionPool) GetConnectionLimit() int {
+	return MAX_CONNECTIONS_PER_IP
+}
+
+func (cp *ConnectionPool) GetRemainingConnections(ip string) int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if count, ok := cp.connections[ip]; ok {
+		return MAX_CONNECTIONS_PER_IP - count
+	}
+
+	return MAX_CONNECTIONS_PER_IP
+}
+
+func (cp *ConnectionPool) AddConnection(ip string) bool {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if count, ok := cp.connections[ip]; ok && count >= MAX_CONNECTIONS_PER_IP {
+		return false
+	}
+
+	cp.connections[ip]++
+	return true
+}
+
+func (cp *ConnectionPool) RemoveConnection(ip string) {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	if count, ok := cp.connections[ip]; ok && count > 0 {
+		cp.connections[ip]--
+	}
 }
 
 func pingTest(c chan float64, URL string) {
@@ -22,12 +67,41 @@ func pingTest(c chan float64, URL string) {
 			return
 		}
 
-		c <- time.Now().Sub(timeStart).Seconds() * 1000
+		c <- float64(time.Since(timeStart).Milliseconds())
 	}
 }
 
 func main() {
+	// Create a connection pool
+	connectionPool := &ConnectionPool{
+		connections: make(map[string]int),
+	}
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// Check if maximum connections per IP reached
+		ip := strings.Split(r.RemoteAddr, ":")[0]
+		if !connectionPool.AddConnection(ip) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusTooManyRequests)
+			json.NewEncoder(w).Encode(map[string]string{
+				"message": "Maximum connections per IP reached.",
+			})
+			return
+		}
+
+		// Remove connection from pool when client disconnects
+		defer connectionPool.RemoveConnection(ip)
+
+		// Check if request method is GET
+		if r.Method != "GET" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			json.NewEncoder(w).Encode(map[string]string{
+				"message": "Method not allowed.",
+			})
+			return
+		}
+
 		// Get URL parameter
 		URL := r.URL.Query().Get("url")
 		if len(URL) == 0 {
@@ -58,6 +132,10 @@ func main() {
 			})
 			return
 		}
+
+		// Set headers for connection limit information
+		w.Header().Set("X-ConnectionLimit-Limit", fmt.Sprintf("%d", connectionPool.GetConnectionLimit()))
+		w.Header().Set("X-ConnectionLimit-Remaining", fmt.Sprintf("%d", connectionPool.GetRemainingConnections(ip)))
 
 		// Create channel
 		c := make(chan float64)
@@ -91,7 +169,7 @@ func main() {
 			// Flush the response buffer after each write
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
-				log.Println(fmt.Sprintf("write tcp %s->%s: write: %f ms", r.Host, r.RemoteAddr, ping))
+				log.Printf("write tcp %s->%s: write: %f ms", r.Host, r.RemoteAddr, ping)
 			}
 
 		}
