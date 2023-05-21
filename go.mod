@@ -1,3 +1,3 @@
-module github.com/vt92i/http-sse
+module github.com/vt92i/rtpt
 
 go 1.20
